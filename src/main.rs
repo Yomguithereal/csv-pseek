@@ -1,4 +1,4 @@
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
 use clap::Parser;
 use csv::{ByteRecord, Reader};
@@ -14,14 +14,15 @@ fn find_max_record_size<R: Read + Seek>(
     let mut last_offset = reader.get_mut().stream_position().unwrap();
 
     while i < max_records_to_read && reader.read_byte_record(&mut record)? {
-        i += 1;
         let record_byte_pos = record.position().unwrap().byte();
         let record_size = record_byte_pos - last_offset;
-        last_offset = record_byte_pos;
 
         if record_size > max_record_size {
             max_record_size = record_size;
         }
+
+        i += 1;
+        last_offset = record_byte_pos;
     }
 
     Ok(max_record_size)
@@ -38,8 +39,9 @@ fn main() -> Result<(), csv::Error> {
     let mut reader = Reader::from_path(args.path).unwrap();
 
     let max_record_size = find_max_record_size(&mut reader, 32)?;
+    let file_len = reader.get_mut().seek(SeekFrom::End(0))?;
 
-    dbg!(max_record_size);
+    dbg!(max_record_size, file_len);
 
     Ok(())
 }
