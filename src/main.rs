@@ -1,7 +1,7 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use clap::Parser;
-use csv::{ByteRecord, Position, Reader, ReaderBuilder};
+use csv::{ByteRecord, Position, Reader, ReaderBuilder, Writer};
 use rand::Rng;
 
 fn find_max_record_size<R: Read + Seek>(
@@ -47,12 +47,19 @@ fn read_byte_record_up_to<R: Read>(
     Ok(true)
 }
 
+#[derive(Debug)]
+enum NextRecord {
+    EndOfFile,
+    Offset(bool, u64),
+    Fail,
+}
+
 fn find_next_record_offset<R: Read + Seek>(
     reader: &mut Reader<R>,
     offset: u64,
     max_record_size: u64,
     expected_field_count: usize,
-) -> Result<Option<u64>, csv::Error> {
+) -> Result<NextRecord, csv::Error> {
     let mut pos = Position::new();
     pos.set_byte(offset);
     reader.seek_raw(SeekFrom::Start(offset), pos)?;
@@ -70,47 +77,47 @@ fn find_next_record_offset<R: Read + Seek>(
     dbg!(record_infos.len());
 
     if record_infos.len() < 2 {
-        return Ok(None);
+        return Ok(NextRecord::EndOfFile);
     }
 
     if record_infos[1..]
         .iter()
         .all(|(_, field_count)| *field_count == expected_field_count)
     {
-        dbg!("we were inside an UNQUOTED cell!");
-        return Ok(Some(record_infos[1].0));
+        return Ok(NextRecord::Offset(false, record_infos[1].0));
     }
 
     let mut pos = Position::new();
     pos.set_byte(offset);
     reader.seek_raw(SeekFrom::Start(offset), pos)?;
 
+    // TODO: quote char must be known if different
     let mut altered_reader = ReaderBuilder::new()
         .flexible(true)
         .has_headers(false)
         .from_reader(Cursor::new("\"").chain(reader.get_mut()));
 
     record_infos.clear();
+    let up_to = max_record_size * 16 + 1;
 
-    while read_byte_record_up_to(&mut altered_reader, &mut record, max_record_size * 16)? {
+    while read_byte_record_up_to(&mut altered_reader, &mut record, up_to)? {
         record_infos.push((record.position().unwrap().byte(), record.len()));
     }
 
     dbg!(record_infos.len());
 
     if record_infos.len() < 2 {
-        return Ok(None);
+        return Ok(NextRecord::EndOfFile);
     }
 
     if record_infos[1..]
         .iter()
         .all(|(_, field_count)| *field_count == expected_field_count)
     {
-        dbg!("we were inside an QUOTED cell!");
-        return Ok(Some(record_infos[1].0));
+        return Ok(NextRecord::Offset(true, offset + record_infos[1].0 - 1));
     }
 
-    Ok(None)
+    Ok(NextRecord::Fail)
 }
 
 #[derive(Parser, Debug)]
@@ -121,8 +128,11 @@ struct Args {
 
 fn main() -> Result<(), csv::Error> {
     let args = Args::parse();
-    let mut reader = ReaderBuilder::new().flexible(true).from_path(args.path)?;
-    let field_count = reader.byte_headers()?.len();
+    let mut reader = ReaderBuilder::new()
+        .flexible(true)
+        .from_path(args.path.clone())?;
+    let headers = reader.byte_headers()?.clone();
+    let field_count = headers.len();
 
     let max_record_size = find_max_record_size(&mut reader, 64)?;
     let file_len = reader.get_mut().seek(SeekFrom::End(0))?;
@@ -130,7 +140,32 @@ fn main() -> Result<(), csv::Error> {
 
     dbg!(field_count, max_record_size, file_len, random_offset);
 
-    find_next_record_offset(&mut reader, random_offset, max_record_size, field_count)?;
+    let next_record =
+        find_next_record_offset(&mut reader, random_offset, max_record_size, field_count)?;
+
+    match next_record {
+        NextRecord::Offset(quoted, offset) => {
+            assert!(offset >= random_offset);
+            dbg!(if quoted { "QUOTED" } else { "UNQUOTED" }, offset);
+
+            let mut writer = Writer::from_writer(std::io::stdout());
+            writer.write_byte_record(&headers)?;
+
+            let mut record = ByteRecord::new();
+            let mut pos = Position::new();
+            pos.set_byte(offset);
+            reader.seek_raw(SeekFrom::Start(offset), pos)?;
+
+            if reader.read_byte_record(&mut record)? {
+                writer.write_byte_record(&record)?;
+            }
+
+            writer.flush()?;
+        }
+        r => {
+            dbg!(r);
+        }
+    }
 
     Ok(())
 }
