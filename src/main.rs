@@ -1,8 +1,10 @@
+use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use clap::Parser;
 use csv::{ByteRecord, Position, Reader, ReaderBuilder, Writer};
 use rand::Rng;
+use rayon::prelude::*;
 
 fn find_max_record_size_from_sample<R: Read + Seek>(
     reader: &mut Reader<R>,
@@ -29,10 +31,10 @@ fn find_max_record_size_from_sample<R: Read + Seek>(
     Ok(max_record_size)
 }
 
-fn read_byte_record_up_to_byte_position<R: Read>(
+fn read_byte_record_up_to<R: Read>(
     reader: &mut Reader<R>,
     record: &mut ByteRecord,
-    up_to: u64,
+    up_to: Option<u64>,
 ) -> Result<bool, csv::Error> {
     let was_read = reader.read_byte_record(record)?;
 
@@ -40,18 +42,30 @@ fn read_byte_record_up_to_byte_position<R: Read>(
         return Ok(false);
     }
 
-    if record.position().unwrap().byte() >= up_to {
-        return Ok(false);
+    if let Some(byte) = up_to {
+        if record.position().unwrap().byte() >= byte {
+            return Ok(false);
+        }
     }
 
     Ok(true)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum NextRecord {
+    Start,
     EndOfFile,
     Offset(bool, u64),
     Fail,
+}
+
+impl NextRecord {
+    fn offset(&self) -> Option<u64> {
+        match self {
+            Self::Offset(_, o) => Some(*o),
+            _ => None,
+        }
+    }
 }
 
 fn find_next_record_offset<R: Read + Seek>(
@@ -70,7 +84,7 @@ fn find_next_record_offset<R: Read + Seek>(
     let mut record_infos = Vec::with_capacity(16);
     let mut record = ByteRecord::new();
 
-    while read_byte_record_up_to_byte_position(reader, &mut record, up_to)? {
+    while read_byte_record_up_to(reader, &mut record, Some(up_to))? {
         record_infos.push((record.position().unwrap().byte(), record.len()));
     }
 
@@ -104,7 +118,7 @@ fn find_next_record_offset<R: Read + Seek>(
     record_infos.clear();
     let up_to = max_record_size * 16 + 1;
 
-    while read_byte_record_up_to_byte_position(&mut altered_reader, &mut record, up_to)? {
+    while read_byte_record_up_to(&mut altered_reader, &mut record, Some(up_to))? {
         record_infos.push((record.position().unwrap().byte(), record.len()));
     }
 
@@ -124,10 +138,27 @@ fn find_next_record_offset<R: Read + Seek>(
     Ok(NextRecord::Fail)
 }
 
+fn segment_file_into_offsets(file_len: u64, threads: usize) -> Vec<u64> {
+    if threads < 2 {
+        return vec![0];
+    }
+
+    let mut offsets = vec![0];
+
+    for i in 1..threads {
+        offsets.push(((i as f64 / threads as f64) * file_len as f64).floor() as u64);
+    }
+
+    offsets
+}
+
 #[derive(Parser, Debug)]
 struct Args {
     /// Path to CSV file to test
     path: String,
+    /// Whether to parallelize reads
+    #[clap(short, long)]
+    parallel: bool,
 }
 
 fn main() -> Result<(), csv::Error> {
@@ -141,34 +172,103 @@ fn main() -> Result<(), csv::Error> {
     let max_record_size = find_max_record_size_from_sample(&mut reader, 64)?;
     let file_len = reader.get_mut().seek(SeekFrom::End(0))?;
     let random_offset = rand::rng().random_range(0..file_len);
+    let segment_offsets = segment_file_into_offsets(file_len, 4);
 
     dbg!(field_count, max_record_size, file_len, random_offset);
+    dbg!(&segment_offsets);
 
-    let next_record =
-        find_next_record_offset(&mut reader, random_offset, max_record_size, field_count)?;
+    // let next_record =
+    //     find_next_record_offset(&mut reader, random_offset, max_record_size, field_count)?;
 
-    match next_record {
-        NextRecord::Offset(quoted, offset) => {
-            assert!(offset >= random_offset);
-            dbg!(if quoted { "QUOTED" } else { "UNQUOTED" }, offset);
+    // match next_record {
+    //     NextRecord::Offset(quoted, offset) => {
+    //         assert!(offset >= random_offset);
+    //         dbg!(if quoted { "QUOTED" } else { "UNQUOTED" }, offset);
 
-            let mut writer = Writer::from_writer(std::io::stdout());
-            writer.write_byte_record(&headers)?;
+    //         let mut writer = Writer::from_writer(std::io::stdout());
+    //         writer.write_byte_record(&headers)?;
 
-            let mut record = ByteRecord::new();
-            let mut pos = Position::new();
-            pos.set_byte(offset);
-            reader.seek_raw(SeekFrom::Start(offset), pos)?;
+    //         let mut record = ByteRecord::new();
+    //         let mut pos = Position::new();
+    //         pos.set_byte(offset);
+    //         reader.seek_raw(SeekFrom::Start(offset), pos)?;
 
-            if reader.read_byte_record(&mut record)? {
-                writer.write_byte_record(&record)?;
+    //         if reader.read_byte_record(&mut record)? {
+    //             writer.write_byte_record(&record)?;
+    //         }
+
+    //         writer.flush()?;
+    //     }
+    //     r => {
+    //         dbg!(r);
+    //     }
+    // }
+
+    let mut next_records = segment_offsets
+        .iter()
+        .copied()
+        .map(|offset| {
+            if offset == 0 {
+                Ok(NextRecord::Start)
+            } else {
+                find_next_record_offset(&mut reader, offset, max_record_size, field_count)
             }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-            writer.flush()?;
+    next_records.push(NextRecord::EndOfFile);
+
+    dbg!(&next_records);
+
+    if !args.parallel {
+        let mut count: u64 = 0;
+        let mut record = ByteRecord::new();
+        let mut reader = Reader::from_path(args.path)?;
+
+        while reader.read_byte_record(&mut record)? {
+            count += 1;
         }
-        r => {
-            dbg!(r);
-        }
+
+        println!("{}", count);
+    } else {
+        let counts = next_records
+            .windows(2)
+            .map(|w| (&w[0], &w[1]))
+            .collect::<Vec<_>>()
+            .par_iter()
+            .map(|(current, next)| -> Result<u64, csv::Error> {
+                let mut count: u64 = 0;
+                let mut record = ByteRecord::new();
+                let file = File::open(args.path.clone())?;
+
+                match current {
+                    NextRecord::Start => {
+                        let mut reader = Reader::from_reader(file);
+
+                        while read_byte_record_up_to(&mut reader, &mut record, next.offset())? {
+                            count += 1;
+                        }
+                    }
+                    NextRecord::Offset(_, offset) => {
+                        let mut reader = Reader::from_reader(file);
+                        let mut pos = Position::new();
+                        pos.set_byte(*offset);
+                        reader.seek(pos)?;
+
+                        while read_byte_record_up_to(&mut reader, &mut record, next.offset())? {
+                            count += 1;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+
+                Ok(count)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        dbg!(&counts);
+
+        println!("{}", counts.iter().sum::<u64>());
     }
 
     Ok(())
