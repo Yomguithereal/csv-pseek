@@ -4,7 +4,7 @@ use clap::Parser;
 use csv::{ByteRecord, Position, Reader, ReaderBuilder, Writer};
 use rand::Rng;
 
-fn find_max_record_size<R: Read + Seek>(
+fn find_max_record_size_from_sample<R: Read + Seek>(
     reader: &mut Reader<R>,
     max_records_to_read: usize,
 ) -> Result<u64, csv::Error> {
@@ -29,7 +29,7 @@ fn find_max_record_size<R: Read + Seek>(
     Ok(max_record_size)
 }
 
-fn read_byte_record_up_to<R: Read>(
+fn read_byte_record_up_to_byte_position<R: Read>(
     reader: &mut Reader<R>,
     record: &mut ByteRecord,
     up_to: u64,
@@ -40,7 +40,7 @@ fn read_byte_record_up_to<R: Read>(
         return Ok(false);
     }
 
-    if record.position().unwrap().byte() > up_to {
+    if record.position().unwrap().byte() >= up_to {
         return Ok(false);
     }
 
@@ -70,7 +70,7 @@ fn find_next_record_offset<R: Read + Seek>(
     let mut record_infos = Vec::with_capacity(16);
     let mut record = ByteRecord::new();
 
-    while read_byte_record_up_to(reader, &mut record, up_to)? {
+    while read_byte_record_up_to_byte_position(reader, &mut record, up_to)? {
         record_infos.push((record.position().unwrap().byte(), record.len()));
     }
 
@@ -80,6 +80,10 @@ fn find_next_record_offset<R: Read + Seek>(
         return Ok(NextRecord::EndOfFile);
     }
 
+    // NOTE: we never return the current record, only the next one, because
+    // even if we have found the expected number of fields in current record,
+    // we cannot likely have read the beginning of first field without reading
+    // backwards.
     if record_infos[1..]
         .iter()
         .all(|(_, field_count)| *field_count == expected_field_count)
@@ -100,7 +104,7 @@ fn find_next_record_offset<R: Read + Seek>(
     record_infos.clear();
     let up_to = max_record_size * 16 + 1;
 
-    while read_byte_record_up_to(&mut altered_reader, &mut record, up_to)? {
+    while read_byte_record_up_to_byte_position(&mut altered_reader, &mut record, up_to)? {
         record_infos.push((record.position().unwrap().byte(), record.len()));
     }
 
@@ -134,7 +138,7 @@ fn main() -> Result<(), csv::Error> {
     let headers = reader.byte_headers()?.clone();
     let field_count = headers.len();
 
-    let max_record_size = find_max_record_size(&mut reader, 64)?;
+    let max_record_size = find_max_record_size_from_sample(&mut reader, 64)?;
     let file_len = reader.get_mut().seek(SeekFrom::End(0))?;
     let random_offset = rand::rng().random_range(0..file_len);
 
